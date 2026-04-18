@@ -1,264 +1,406 @@
 # Multi-Channel Notification Service - Design Document
 
-## Overview
+## Architecture Overview
 
-The Multi-Channel Notification Service is a high-performance, asynchronous notification system that supports email, SMS, and push notifications. The service is built with Go and emphasizes concurrency, reliability, and graceful degradation.
+### Components and Interactions
 
-## Architecture
-
-### High-Level Architecture
+The notification service follows a layered architecture with clear separation of concerns:
 
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Client    │───▶│  HTTP API   │───▶│   Service   │
-└─────────────┘    └─────────────┘    └─────────────┘
-                                             │
-                                             ▼
-                                      ┌─────────────┐
-                                      │    Queue    │
-                                      └─────────────┘
-                                             │
-                                             ▼
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ Email Worker│    │  SMS Worker │    │ Push Worker │
-└─────────────┘    └─────────────┘    └─────────────┘
-       │                   │                   │
-       ▼                   ▼                   ▼
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ Email Sender│    │  SMS Sender │    │ Push Sender │
-└─────────────┘    └─────────────┘    └─────────────┘
+   Client    HTTP API    Service     Queue      Workers      Senders
+    |          |          |          |           |            |
+    |---POST---|          |          |           |            |
+    |          |---Create-|          |           |            |
+    |          |          |---Queue--|           |            |
+    |          |          |          |---Route---|            |
+    |          |          |          |    |      |---Process--|
+    |          |          |          |    |      |            |
+    |          |          |          |    |      |----Send----|
+    |          |          |          |    |      |            |
+    |          |          |          |    |      |---Update---|
+    |          |          |          |    |      |            |
+    |          |---GET----|          |           |            |
+    |          |          |--Retrieve|           |            |
+    |<--Status-|          |          |           |            |
 ```
 
-### Component Breakdown
+### ASCII Architecture Flow
 
-#### 1. HTTP API Layer (`internal/api`)
-- **Purpose**: Expose REST endpoints for external clients
-- **Key Components**:
-  - `Handler`: Manages HTTP request/response lifecycle
-  - Routes: `/notify`, `/notifications/{id}`, `/health`
-- **Design Decisions**:
-  - Uses Gin framework for performance and simplicity
-  - Structured logging middleware for observability
-  - JSON request/response format
+```
+                                      HTTP Requests
+                                           |
+                                           v
+                                   +-----------------+
+                                   |   HTTP API      |
+                                   |   (Gin Router)  |
+                                   +-----------------+
+                                           |
+                                           v
+                                   +-----------------+
+                                   |    Service      |
+                                   |   (Business     |
+                                   |    Logic)       |
+                                   +-----------------+
+                                           |
+                                           v
+                                   +-----------------+
+                                   |     Queue       |
+                                   |  (Go Channels)  |
+                                   +-----------------+
+                                           |
+                                           v
+                          +------------------+------------------+
+                          |                  |                  |
+                          v                  v                  v
+                  +-------------+    +-------------+    +-------------+
+                  |Email Worker |    | SMS Worker  |    |Push Worker  |
+                  +-------------+    +-------------+    +-------------+
+                          |                  |                  |
+                          v                  v                  v
+                  +-------------+    +-------------+    +-------------+
+                  |Email Sender |    | SMS Sender  |    |Push Sender  |
+                  +-------------+    +-------------+    +-------------+
+                          |                  |                  |
+                          v                  v                  v
+                  +---------------------------------------------+
+                  |             Shared Storage Layer            |
+                  |            (SQLite or In-Memory)            |
+                  +---------------------------------------------+
+```
 
-#### 2. Service Layer (`internal/service`)
-- **Purpose**: Core business logic and notification orchestration
-- **Key Components**:
-  - `Service`: Main service orchestrator
-  - Queue management for asynchronous processing
-- **Design Decisions**:
-  - Channel-based queue for decoupling API from processing
-  - Immediate acceptance of requests with async processing
-  - Simple ID generation for notifications
+### Component Responsibilities
 
-#### 3. Delivery Layer (`internal/delivery`)
-- **Purpose**: Handle notification delivery with rate limiting and retries
-- **Key Components**:
-  - `Manager`: Coordinates multiple workers
-  - `Worker`: Processes notifications for a specific channel
-  - `Sender`: Mock implementations for each channel
-- **Design Decisions**:
-  - Separate workers per channel for isolation
-  - Token bucket rate limiting per channel
-  - Exponential backoff retry mechanism
+- **HTTP API**: Handles incoming requests, validation, and responses
+- **Service**: Business logic, notification creation, and queue management
+- **Queue**: Asynchronous message routing between service and workers
+- **Workers**: Per-channel processing with rate limiting and retry logic
+- **Senders**: Mock delivery implementations with configurable failure rates
+- **Storage**: Persistent or in-memory storage for notification state
 
-#### 4. Storage Layer (`internal/storage`)
-- **Purpose**: Persistent storage for notification state
-- **Key Components**:
-  - `Storage`: Interface abstraction
-  - `MemoryStorage`: In-memory implementation
-  - `SQLiteStorage`: SQLite implementation
-- **Design Decisions**:
-  - Interface-based design for testability
-  - Configurable storage backend
-  - Thread-safe operations
+## Key Design Decisions and Tradeoffs
 
-#### 5. Configuration (`internal/config`)
-- **Purpose**: Centralized configuration management
-- **Key Components**:
-  - Environment variable support
-  - Validation and defaults
-  - Structured logging setup
+### Queue Architecture: Unified vs Per-Channel
 
-## Data Flow
+**Decision**: Unified queue with channel-based routing
 
-### Notification Creation Flow
-1. Client sends POST request to `/notify` endpoint
-2. API layer validates request and creates notification object
-3. Service layer stores notification in database
-4. Notification is queued for processing
-5. API immediately returns notification ID to client
+**Implementation**:
+```go
+// Single queue from service to delivery manager
+queue := make(chan *storage.Notification, 1000)
 
-### Processing Flow
-1. Delivery manager routes notifications to appropriate channel workers
-2. Workers apply rate limiting before processing
-3. Senders attempt delivery with configurable failure rates
-4. Failed notifications are retried with exponential backoff
-5. Successful/failed notifications are updated in storage
+// Delivery manager routes to separate worker channels
+emailChan := make(chan *storage.Notification, 100)
+smsChan := make(chan *storage.Notification, 100)
+pushChan := make(chan *storage.Notification, 100)
+```
 
-### Status Query Flow
-1. Client sends GET request to `/notifications/{id}`
-2. Service retrieves notification from storage
-3. Current status and metadata are returned
+**Reasoning**:
+- **Simplified API Layer**: Single queue point reduces complexity in service layer
+- **Channel Isolation**: Separate worker channels prevent cross-channel interference
+- **Easy Monitoring**: Single point to measure overall system throughput
+- **Graceful Degradation**: If one channel fails, others continue processing
+
+**Tradeoffs**:
+- **Pros**: Simple API interface, clear separation of concerns, easy debugging
+- **Cons**: Additional routing logic, potential bottleneck at delivery manager
+
+**Alternative Rejected**: Separate queues per channel
+- **Why Rejected**: Would complicate API layer and increase coordination overhead
+
+### Worker Pool Size
+
+**Decision**: One worker per channel (fixed pool size of 3)
+
+**Implementation**:
+```go
+workers := []*Worker{
+    NewWorker(storage.ChannelEmail, emailConfig, storage, logger),
+    NewWorker(storage.ChannelSMS, smsConfig, storage, logger),
+    NewWorker(storage.ChannelPush, pushConfig, storage, logger),
+}
+```
+
+**Reasoning**:
+- **Predictable Resource Usage**: Fixed number of goroutines
+- **Channel Isolation**: Each worker handles only its channel type
+- **Simple Rate Limiting**: Per-worker rate limiting is straightforward
+- **Easy Monitoring**: One worker per channel simplifies debugging
+
+**Tradeoffs**:
+- **Pros**: Simple to monitor, predictable memory usage, easy horizontal scaling
+- **Cons**: Limited throughput per channel, single point of failure per channel
+
+**Alternatives Considered**:
+- **Dynamic Pool**: Would add complexity for minimal benefit at current scale
+- **Multiple Workers per Channel**: Could improve throughput but adds coordination complexity
+
+### Storage Backend: In-Memory vs SQLite
+
+**Decision**: Support both SQLite and in-memory storage
+
+**Implementation**:
+```go
+func NewStorage(cfg *config.Config) (Storage, error) {
+    switch cfg.Database.Type {
+    case "sqlite":
+        return NewSQLiteStorage(cfg.Database.Path)
+    case "memory":
+        return NewMemoryStorage()
+    default:
+        return nil, fmt.Errorf("unsupported database type: %s", cfg.Database.Type)
+    }
+}
+```
+
+**Reasoning**:
+- **Development Flexibility**: In-memory for quick testing, SQLite for persistence
+- **Production Readiness**: SQLite provides data persistence across restarts
+- **Migration Path**: Interface abstraction allows future database changes
+- **Testing**: In-memory storage simplifies unit tests
+
+**Tradeoffs**:
+- **Pros**: Development flexibility, production reliability, easy migration
+- **Cons**: SQLite limits horizontal scaling, in-memory loses data on restart
 
 ## Concurrency Model
 
-### Goroutine Usage
-- **HTTP Server**: Runs in main goroutine with connection pooling
-- **Delivery Manager**: One goroutine for routing notifications
-- **Workers**: One goroutine per channel (email, SMS, push)
-- **Retries**: Separate goroutines for retry scheduling
+### Channel Isolation Strategy
 
-### Synchronization Primitives
-- **Channels**: Primary communication mechanism between components
-- **Mutexes**: Used in storage layer for thread safety
-- **Context**: For cancellation and timeout handling
+**Implementation**:
+```go
+// Separate goroutines for each channel
+func (m *Manager) Start(notifications <-chan *storage.Notification) {
+    // Create separate channels for each worker type
+    emailChan := make(chan *storage.Notification, 100)
+    smsChan := make(chan *storage.Notification, 100)
+    pushChan := make(chan *storage.Notification, 100)
 
-### Rate Limiting
-- **Implementation**: Token bucket algorithm (`golang.org/x/time/rate`)
-- **Per-Channel Limits**:
-  - Email: 100 requests/second
-  - SMS: 20 requests/second
-  - Push: 500 requests/second
+    // Start workers in separate goroutines
+    for _, worker := range m.workers {
+        m.wg.Add(1)
+        go func(w *Worker, workerChan chan *storage.Notification) {
+            defer m.wg.Done()
+            w.Start(m.ctx, workerChan)
+        }(worker, ch)
+    }
+}
+```
 
-## Error Handling and Reliability
+**Benefits**:
+- **Fault Isolation**: Email failures don't affect SMS/push processing
+- **Independent Rate Limiting**: Each channel enforces its own limits
+- **Simplified Debugging**: Easy to monitor per-channel performance
+- **Graceful Degradation**: One channel failure doesn't stop others
 
-### Retry Strategy
-- **Maximum Retries**: 3 attempts per notification
-- **Backoff Algorithm**: Exponential (100ms → 200ms → 400ms)
-- **Failure Classification**: Transient vs permanent errors
+### Goroutine Leak Prevention
 
-### Failure Scenarios
-1. **Network Failures**: Retried with backoff
-2. **Rate Limit Exceeded**: Worker blocks until tokens available
-3. **Service Shutdown**: In-flight notifications marked as pending
-4. **Database Failures**: Error returned to client
+**Key Strategies**:
 
-### Graceful Shutdown
-1. Stop accepting new HTTP requests
-2. Signal workers to finish current work
-3. Wait for in-flight notifications (10-second timeout)
-4. Close database connections
-5. Exit process
+1. **Context-Based Cancellation**:
+```go
+ctx, cancel := context.WithCancel(context.Background())
 
-## Design Tradeoffs
+// All goroutines respect context cancellation
+select {
+case <-ctx.Done():
+    return  // Exit gracefully
+case notification := <-notifications:
+    // Process notification
+}
+```
 
-### Queue Architecture
-**Decision**: Unified queue with channel-based routing
-**Rationale**:
-- **Unified Queue**: Single queue from service to delivery manager simplifies API layer
-- **Channel-Based Routing**: Separate channels (emailChan, smsChan, pushChan) provide isolation
-- **Benefits**:
-  - Simplified API interface (single queue point)
-  - Channel isolation prevents cross-channel interference
-  - Easy to monitor and debug per-channel throughput
-  - Graceful degradation (if one channel fails, others continue)
-- **Alternative Considered**: Separate queues per channel
-  - **Rejected**: Would complicate API layer and increase coordination overhead
+2. **WaitGroup Tracking**:
+```go
+var wg sync.WaitGroup
 
-### Worker Pool Design
-**Decision**: One worker per channel (fixed pool size of 3)
-**Rationale**:
-- **Fixed Pool Size**: One worker per channel provides predictable resource usage
-- **Channel Isolation**: Each worker handles only its channel type
-- **Rate Limiting**: Per-worker rate limiting is straightforward
-- **Benefits**:
-  - Simple to monitor and debug
-  - Predictable memory and CPU usage
-  - Easy to scale horizontally (multiple service instances)
-- **Alternatives Considered**:
-  - **Dynamic Pool**: Would add complexity for minimal benefit at current scale
-  - **Multiple Workers per Channel**: Could improve throughput but adds coordination complexity
+// Every goroutine is tracked
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    // Work here
+}()
 
-### Storage Backend Choice
-**Decision**: Support both SQLite and in-memory storage
-**Rationale**:
-- **SQLite**: Provides persistence for production use cases
-- **In-Memory**: Simplifies testing and development
-- **Interface Abstraction**: Allows future database migration
-- **Benefits**:
-  - Development flexibility (in-memory for quick testing)
-  - Production reliability (SQLite for persistence)
-  - Easy migration path to distributed databases
-- **Tradeoffs**:
-  - SQLite limits horizontal scaling
-  - In-memory loses data on restart
-  - Both acceptable for current requirements
+// Wait for all to finish
+wg.Wait()
+```
 
-### Mock Senders
-**Decision**: Mock implementations instead of real integrations
-**Rationale**:
-- Focus on core service architecture
-- Configurable failure rates for testing
-- Easy to extend with real implementations
+3. **Proper Channel Closure**:
+```go
+// Close channels to signal completion
+defer close(emailChan)
+defer close(smsChan)
+defer close(pushChan)
+```
 
-### Rate Limiting Strategy
-**Decision**: In-process rate limiting per channel
-**Rationale**:
-- Prevents overwhelming external services
-- Fair resource allocation between channels
-- Simple to implement and monitor
+4. **Timeout Handling**:
+```go
+// Shutdown with timeout
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+```
+
+**Failure Scenarios Handled**:
+- **Channel Blocking**: Non-blocking sends with context checks
+- **Worker Crashes**: Separate goroutines prevent cascade failures
+- **Resource Exhaustion**: Buffered channels prevent blocking
+
+## Failure Handling
+
+### Process Crash Mid-Delivery
+
+**Current Behavior**:
+- **In-Memory Storage**: All pending notifications lost on restart
+- **SQLite Storage**: Notifications remain in "pending" state in database
+- **No Automatic Recovery**: Manual restart required
+
+**Production-Grade Enhancements Needed**:
+
+1. **Persistent Queue System**:
+```go
+// Replace Go channels with external queue
+type PersistentQueue interface {
+    Enqueue(notification *Notification) error
+    Dequeue() (*Notification, error)
+    Ack(id string) error
+}
+```
+
+2. **Death Detection and Recovery**:
+```go
+// Worker heartbeat mechanism
+func (w *Worker) startHeartbeat() {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            w.updateHeartbeat()
+        case <-w.ctx.Done():
+            return
+        }
+    }
+}
+```
+
+3. **Automatic Recovery on Restart**:
+```go
+// Recover pending notifications on startup
+func (s *Service) RecoverPendingNotifications() error {
+    pending, err := s.storage.ListByStatus(storage.StatusPending)
+    if err != nil {
+        return err
+    }
+    
+    // Re-queue all pending notifications
+    for _, notif := range pending {
+        s.queue <- notif
+    }
+    return nil
+}
+```
+
+4. **Enhanced Monitoring**:
+- Failed delivery alerts
+- Queue depth monitoring
+- Worker health checks
+- Automatic restart on failure
 
 ## Scaling Considerations
 
-### Horizontal Scaling
-- **Stateless Design**: HTTP layer can be scaled horizontally
-- **Database**: SQLite can be replaced with distributed database
-- **Queue**: Can be replaced with Redis or RabbitMQ
+### Multi-Instance Deployment Challenges
 
-### Performance Optimizations
-- **Connection Pooling**: Database and HTTP connection reuse
-- **Batch Processing**: Future optimization for bulk notifications
-- **Caching**: Redis for frequently accessed notifications
+**Current Limitations**:
+- **In-Memory Queue**: Not shared across instances
+- **SQLite Database**: Single-instance file locking
+- **No Coordination**: Multiple instances would process same notifications
 
-### Monitoring and Observability
-- **Structured Logging**: JSON format with correlation IDs
-- **Metrics**: Counters for success/failure rates
-- **Health Checks**: Service and dependency health monitoring
+### Production Scaling Architecture
 
-## Security Considerations
+1. **External Message Queue**:
+   - **Redis Streams**: High-performance, persistent
+   - **RabbitMQ**: Reliable message routing
+   - **Apache Kafka**: For massive scale
 
-### Input Validation
-- **Request Validation**: JSON schema validation
-- **Rate Limiting**: Prevent abuse and DoS attacks
-- **Input Sanitization**: Basic sanitization of message content
+```go
+// External queue integration
+type QueueConsumer interface {
+    Subscribe(channel string) (<-chan *Notification, error)
+    Ack(notification *Notification) error
+}
+```
 
-### Data Protection
-- **PII Handling**: Careful logging of sensitive information
-- **Encryption**: Future consideration for message content
-- **Access Control**: API authentication (future enhancement)
+2. **Shared Database**:
+   - **PostgreSQL**: ACID compliance, connection pooling
+   - **MySQL**: Proven reliability, horizontal scaling
+   - **MongoDB**: Document-based, sharding support
 
-## Future Enhancements
+3. **Service Discovery & Load Balancing**:
+   - **Consul/Etcd**: Service registration
+   - **NGINX/HAProxy**: HTTP load balancing
+   - **Kubernetes**: Container orchestration
 
-### Short-term
-1. **Real Sender Implementations**: SMTP, Twilio, FCM/APNS
-2. **Authentication**: JWT-based API authentication
-3. **Metrics**: Prometheus metrics integration
-4. **Batch Operations**: Bulk notification sending
+4. **Stateless Service Layer**:
+```go
+// Stateless service instances
+type Service struct {
+    queue    QueueConsumer  // External queue
+    storage  Storage        // Shared database
+    workers  []*Worker      // Per-instance workers
+}
+```
 
-### Long-term
-1. **Message Templates**: Template-based notifications
-2. **User Preferences**: Per-user channel preferences
-3. **Analytics**: Delivery analytics and reporting
-4. **Multi-tenant**: Support for multiple organizations
+### Scaling Strategies
 
-## Testing Strategy
+**Horizontal Scaling**:
+- **Multiple Instances**: Add/remove instances dynamically
+- **Load Balancing**: Distribute HTTP requests across instances
+- **Shared Queue**: External message queue for coordination
 
-### Unit Tests
-- **Storage Layer**: CRUD operations and concurrency
-- **Delivery Layer**: Rate limiting and retry logic
-- **Service Layer**: Business logic validation
+**Vertical Scaling**:
+- **Worker Pool Size**: Configurable per instance
+- **Channel Capacity**: Dynamic buffer sizing
+- **Database Connections**: Connection pooling optimization
 
-### Integration Tests
-- **End-to-End Flow**: API → Queue → Processing → Storage
-- **Concurrent Scenarios**: Multiple simultaneous requests
-- **Failure Scenarios**: Service degradation and recovery
+**Data Partitioning**:
+- **Channel-based Sharding**: Different channels on different instances
+- **Geographic Distribution**: Regional instance deployment
+- **Time-based Partitioning**: Load balancing by time windows
 
-### Performance Tests
-- **Load Testing**: High-volume notification processing
-- **Stress Testing**: System behavior under extreme load
-- **Latency Testing**: End-to-end response times
+### Production Readiness Checklist
+
+**Infrastructure**:
+- [ ] External message queue (Redis/RabbitMQ)
+- [ ] Shared database (PostgreSQL/MySQL)
+- [ ] Load balancer configuration
+- [ ] Service discovery setup
+
+**Monitoring**:
+- [ ] Prometheus metrics collection
+- [ ] Grafana dashboards
+- [ ] Alert rules for failures
+- [ ] Log aggregation (ELK stack)
+
+**Reliability**:
+- [ ] Health check endpoints
+- [ ] Circuit breakers for external services
+- [ ] Retry policies with exponential backoff
+- [ ] Graceful shutdown handling
+
+**Security**:
+- [ ] API authentication (JWT/OAuth)
+- [ ] Rate limiting per client
+- [ ] Input validation and sanitization
+- [ ] TLS encryption for all traffic
 
 ## Conclusion
 
 The Multi-Channel Notification Service provides a solid foundation for reliable, scalable notification delivery. The architecture emphasizes simplicity, testability, and operational efficiency while providing clear paths for future enhancement and scaling.
+
+Key design decisions prioritize:
+- **Simplicity** over complexity
+- **Reliability** over performance
+- **Observability** over opacity
+- **Extensibility** over optimization
+
+This approach ensures the service can evolve from a single-instance deployment to a production-grade, multi-instance system with minimal architectural changes.
