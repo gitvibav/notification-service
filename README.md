@@ -223,35 +223,6 @@ GOOS=darwin GOARCH=amd64 go build -o notification-service-darwin-amd64 cmd/serve
 GOOS=windows GOARCH=amd64 go build -o notification-service-windows-amd64.exe cmd/server/main.go
 ```
 
-### Docker Support
-
-Create a `Dockerfile`:
-
-```dockerfile
-FROM golang:1.21-alpine AS builder
-
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-RUN go build -o notification-service cmd/server/main.go
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-
-COPY --from=builder /app/notification-service .
-EXPOSE 8080
-
-CMD ["./notification-service"]
-```
-
-Build and run:
-
-```bash
-docker build -t notification-service .
-docker run -p 8080:8080 notification-service
 ```
 
 ## Monitoring and Logging
