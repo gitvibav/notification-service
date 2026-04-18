@@ -62,10 +62,10 @@ The notification service follows a layered architecture with clear separation of
                   +-------------+    +-------------+    +-------------+
                           |                  |                  |
                           v                  v                  v
-                  +---------------------------------------------+
-                  |             Shared Storage Layer            |
-                  |            (SQLite or In-Memory)            |
-                  +---------------------------------------------+
+                     +---------------------------------------------+
+                     |             Shared Storage Layer            |
+                     |            (SQLite or In-Memory)            |
+                     +---------------------------------------------+
 ```
 
 ### Component Responsibilities
