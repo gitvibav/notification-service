@@ -19,6 +19,7 @@ A high-performance, asynchronous notification service built with Go that support
 
 - Go 1.21 or later
 - Git
+- Make (optional, for build scripts)
 
 ### Installation
 
