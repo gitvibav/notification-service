@@ -143,20 +143,47 @@ The Multi-Channel Notification Service is a high-performance, asynchronous notif
 
 ## Design Tradeoffs
 
+### Queue Architecture
+**Decision**: Unified queue with channel-based routing
+**Rationale**:
+- **Unified Queue**: Single queue from service to delivery manager simplifies API layer
+- **Channel-Based Routing**: Separate channels (emailChan, smsChan, pushChan) provide isolation
+- **Benefits**:
+  - Simplified API interface (single queue point)
+  - Channel isolation prevents cross-channel interference
+  - Easy to monitor and debug per-channel throughput
+  - Graceful degradation (if one channel fails, others continue)
+- **Alternative Considered**: Separate queues per channel
+  - **Rejected**: Would complicate API layer and increase coordination overhead
+
+### Worker Pool Design
+**Decision**: One worker per channel (fixed pool size of 3)
+**Rationale**:
+- **Fixed Pool Size**: One worker per channel provides predictable resource usage
+- **Channel Isolation**: Each worker handles only its channel type
+- **Rate Limiting**: Per-worker rate limiting is straightforward
+- **Benefits**:
+  - Simple to monitor and debug
+  - Predictable memory and CPU usage
+  - Easy to scale horizontally (multiple service instances)
+- **Alternatives Considered**:
+  - **Dynamic Pool**: Would add complexity for minimal benefit at current scale
+  - **Multiple Workers per Channel**: Could improve throughput but adds coordination complexity
+
 ### Storage Backend Choice
 **Decision**: Support both SQLite and in-memory storage
 **Rationale**:
-- SQLite provides persistence for production
-- In-memory storage simplifies testing and development
-- Interface abstraction allows future database changes
-
-### Queue Implementation
-**Decision**: Go channels instead of external message queue
-**Rationale**:
-- Simpler deployment and operation
-- Adequate for current scale requirements
-- Lower operational overhead
-- Can be migrated to external queue if needed
+- **SQLite**: Provides persistence for production use cases
+- **In-Memory**: Simplifies testing and development
+- **Interface Abstraction**: Allows future database migration
+- **Benefits**:
+  - Development flexibility (in-memory for quick testing)
+  - Production reliability (SQLite for persistence)
+  - Easy migration path to distributed databases
+- **Tradeoffs**:
+  - SQLite limits horizontal scaling
+  - In-memory loses data on restart
+  - Both acceptable for current requirements
 
 ### Mock Senders
 **Decision**: Mock implementations instead of real integrations
