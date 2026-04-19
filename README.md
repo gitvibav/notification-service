@@ -223,13 +223,12 @@ GOOS=darwin GOARCH=amd64 go build -o notification-service-darwin-amd64 cmd/serve
 GOOS=windows GOARCH=amd64 go build -o notification-service-windows-amd64.exe cmd/server/main.go
 ```
 
-```
-
 ## Monitoring and Logging
 
 ### Logging
 
 The service uses structured JSON logging with the following fields:
+
 - `timestamp`: Request timestamp
 - `level`: Log level (debug, info, warn, error)
 - `message`: Log message
@@ -246,16 +245,19 @@ The service uses structured JSON logging with the following fields:
 ## Performance Characteristics
 
 ### Throughput
+
 - **Email**: Up to 100 requests/second
 - **SMS**: Up to 20 requests/second  
 - **Push**: Up to 500 requests/second
 
 ### Latency
+
 - **API Response**: < 10ms (immediate queuing)
 - **Processing**: 10-60ms per notification (including simulated delay)
 - **Retry Backoff**: 100ms → 200ms → 400ms
 
 ### Resource Usage
+
 - **Memory**: ~50MB base + notification queue
 - **CPU**: Low CPU usage with burst during processing
 - **Storage**: SQLite file grows with notification history
